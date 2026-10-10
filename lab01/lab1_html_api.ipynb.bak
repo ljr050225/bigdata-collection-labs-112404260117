@@ -1,0 +1,785 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "97f6d251",
+   "metadata": {},
+   "source": [
+    "# Lab 1 - 静态页面与 API 数据采集\n",
+    "\n",
+    "**学生：** （请在 REPORT.md 中填写）\n",
+    "**学号：** 112404260117\n",
+    "**平台：** SmartPark DataLab (https://115.159.159.82)\n",
+    "\n",
+    "> 本 Notebook 完成以下任务：\n",
+    "> 1. 探测 Device API 与 Company 静态页面\n",
+    "> 2. 设备分页采集（5000 条）\n",
+    "> 3. 企业静态页解析（3 页共 60 条）\n",
+    "> 4. 一致性验证（Company–Device mismatch == 0）\n",
+    "> 5. 保存 JSON 数据\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "2da1a6e0",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:26.604506Z",
+     "iopub.status.busy": "2026-10-10T07:57:26.604273Z",
+     "iopub.status.idle": "2026-10-10T07:57:26.687753Z",
+     "shell.execute_reply": "2026-10-10T07:57:26.687131Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "环境就绪\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 0. 准备工作：导入依赖 + 关闭 SSL 警告\n",
+    "import urllib3\n",
+    "urllib3.disable_warnings()\n",
+    "\n",
+    "import requests\n",
+    "from bs4 import BeautifulSoup\n",
+    "from urllib.parse import urljoin\n",
+    "from collections import Counter\n",
+    "from pathlib import Path\n",
+    "import json\n",
+    "\n",
+    "BASE_URL = \"https://115.159.159.82\"\n",
+    "session = requests.Session()\n",
+    "session.verify = False\n",
+    "print(\"环境就绪\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "48a637a3",
+   "metadata": {},
+   "source": [
+    "# 任务 1：判断数据加载方式\n",
+    "\n",
+    "## 1.1 Device：动态加载 → API\n",
+    "\n",
+    "`/devices` 页面初始 HTML 不含设备数据，只显示\"正在读取设备数据…\"，需要通过 API 动态加载。"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "8c11880a",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:26.689261Z",
+     "iopub.status.busy": "2026-10-10T07:57:26.689070Z",
+     "iopub.status.idle": "2026-10-10T07:57:26.961777Z",
+     "shell.execute_reply": "2026-10-10T07:57:26.961106Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "初始 HTML 长度: 2949\n",
+      "tbody 内文本: 正在加载…\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 查看 /devices 静态 HTML 的关键片段\n",
+    "r = session.get(f\"{BASE_URL}/devices\", timeout=10)\n",
+    "soup = BeautifulSoup(r.text, \"html.parser\")\n",
+    "# 初始 HTML 中是否含设备名？\n",
+    "print(\"初始 HTML 长度:\", len(r.text))\n",
+    "print(\"tbody 内文本:\", soup.select_one(\"tbody\").get_text(\" | \", strip=True)[:200])\n",
+    "# 结论：设备数据不在初始 HTML 中 → 动态加载 → 查 API\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "6bb8baab",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:26.963307Z",
+     "iopub.status.busy": "2026-10-10T07:57:26.963088Z",
+     "iopub.status.idle": "2026-10-10T07:57:27.094767Z",
+     "shell.execute_reply": "2026-10-10T07:57:27.094088Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "status: 200\n",
+      "url: https://115.159.159.82/api/devices?page=1&page_size=50\n",
+      "content-type: application/json\n",
+      "type: dict\n",
+      "keys: ['page', 'page_size', 'total', 'items']\n",
+      "total: 5000\n",
+      "page: 1\n",
+      "page_size: 50\n",
+      "first item keys: ['device_id', 'company_id', 'device_name', 'device_type', 'model', 'zone', 'install_date', 'rated_power_kw', 'sampling_interval_s', 'protocol', 'status', 'updated_at']\n",
+      "first item: {'device_id': 'D00000001', 'company_id': 'C000001', 'device_name': '循环泵-000001-001', 'device_type': 'pump', 'model': 'SP-PUM-800', 'zone': '智造一区', 'install_date': '2021-09-19', 'rated_power_kw': 71.2, 'sampling_interval_s': 30, 'protocol': 'mqtt', 'status': 'running', 'updated_at': '2026-09-01T03:58:00'}\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 验证 API：/api/devices\n",
+    "api_url = f\"{BASE_URL}/api/devices\"\n",
+    "r = session.get(api_url, params={\"page\": 1, \"page_size\": 50}, timeout=10)\n",
+    "print(\"status:\", r.status_code)\n",
+    "print(\"url:\", r.url)\n",
+    "print(\"content-type:\", r.headers.get(\"Content-Type\"))\n",
+    "data = r.json()\n",
+    "print(\"type:\", type(data).__name__)\n",
+    "print(\"keys:\", list(data.keys()))\n",
+    "print(\"total:\", data[\"total\"])\n",
+    "print(\"page:\", data[\"page\"])\n",
+    "print(\"page_size:\", data[\"page_size\"])\n",
+    "print(\"first item keys:\", list(data[\"items\"][0].keys()))\n",
+    "print(\"first item:\", data[\"items\"][0])\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "3938f067",
+   "metadata": {},
+   "source": [
+    "## 1.2 Company：静态加载 → HTML\n",
+    "\n",
+    "`/companies` 的初始 HTML 中已包含企业数据，可以直接请求并解析。"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "8ea411e2",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:27.096241Z",
+     "iopub.status.busy": "2026-10-10T07:57:27.096052Z",
+     "iopub.status.idle": "2026-10-10T07:57:27.175235Z",
+     "shell.execute_reply": "2026-10-10T07:57:27.174652Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "本页企业数: 20\n",
+      "示例节点 attrs: {'class': ['company-card'], 'data-company-id': 'C000001'}\n",
+      "示例企业名称: 临港精工001有限公司\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 验证 /companies 静态 HTML 中已包含企业名\n",
+    "r = session.get(f\"{BASE_URL}/companies\", timeout=10)\n",
+    "soup = BeautifulSoup(r.text, \"html.parser\")\n",
+    "# 找到企业记录节点\n",
+    "cards = soup.select(\"article.company-card\")\n",
+    "print(\"本页企业数:\", len(cards))\n",
+    "print(\"示例节点 attrs:\", cards[0].attrs)\n",
+    "print(\"示例企业名称:\", cards[0].select_one(\"h2 a\").get_text(strip=True))\n",
+    "# 结论：HTML 中已有企业数据 → 静态加载\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "e18ba371",
+   "metadata": {},
+   "source": [
+    "# 任务 2：Device API 分页采集\n",
+    "\n",
+    "API 分页结构：\n",
+    "- 当前页：`page`\n",
+    "- 每页条数：`page_size`\n",
+    "- 设备总数：`total`\n",
+    "- 设备列表：`items`\n",
+    "\n",
+    "总页数通过 `ceil(total/page_size)` 计算，不写死。"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "8cce611f",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:27.176578Z",
+     "iopub.status.busy": "2026-10-10T07:57:27.176346Z",
+     "iopub.status.idle": "2026-10-10T07:57:27.179543Z",
+     "shell.execute_reply": "2026-10-10T07:57:27.179028Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "total: 5000\n",
+      "page_size: 50\n",
+      "total_pages: 100\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 2.1 用第一页响应读取分页信息\n",
+    "total = data[\"total\"]\n",
+    "page_size = data[\"page_size\"]\n",
+    "total_pages = (total + page_size - 1) // page_size\n",
+    "print(\"total:\", total)\n",
+    "print(\"page_size:\", page_size)\n",
+    "print(\"total_pages:\", total_pages)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "id": "230b229c",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:27.180748Z",
+     "iopub.status.busy": "2026-10-10T07:57:27.180571Z",
+     "iopub.status.idle": "2026-10-10T07:57:34.900270Z",
+     "shell.execute_reply": "2026-10-10T07:57:34.898666Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  page 1/100, got 50 items\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  page 10/100, got 50 items\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  page 20/100, got 50 items\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  page 30/100, got 50 items\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  page 40/100, got 50 items\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  page 50/100, got 50 items\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  page 60/100, got 50 items\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  page 70/100, got 50 items\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  page 80/100, got 50 items\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  page 90/100, got 50 items\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  page 100/100, got 50 items\n",
+      "[done] 采集完成，耗时 7.7s\n",
+      "device count: 5000\n",
+      "unique device_id: 5000\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 2.2 完整分页采集所有设备\n",
+    "import time\n",
+    "\n",
+    "devices = []\n",
+    "t0 = time.time()\n",
+    "for page in range(1, total_pages + 1):\n",
+    "    r = session.get(\n",
+    "        api_url,\n",
+    "        params={\"page\": page, \"page_size\": page_size},\n",
+    "        timeout=10,\n",
+    "    )\n",
+    "    page_data = r.json()\n",
+    "    page_items = page_data[\"items\"]\n",
+    "    devices.extend(page_items)\n",
+    "    if page % 10 == 0 or page == 1:\n",
+    "        print(f\"  page {page}/{total_pages}, got {len(page_items)} items\")\n",
+    "\n",
+    "print(f\"[done] 采集完成，耗时 {time.time()-t0:.1f}s\")\n",
+    "print(\"device count:\", len(devices))\n",
+    "print(\"unique device_id:\", len(set(d[\"device_id\"] for d in devices)))\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "bca06af3",
+   "metadata": {},
+   "source": [
+    "# 任务 3：Company HTML 解析（第一页）"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "59664900",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:34.902907Z",
+     "iopub.status.busy": "2026-10-10T07:57:34.902575Z",
+     "iopub.status.idle": "2026-10-10T07:57:34.972666Z",
+     "shell.execute_reply": "2026-10-10T07:57:34.971995Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "本页企业数: 20\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 3.1 设计 selector 并验证\n",
+    "current_url = f\"{BASE_URL}/companies\"\n",
+    "soup = BeautifulSoup(session.get(current_url, timeout=10).text, \"html.parser\")\n",
+    "\n",
+    "# 企业记录 selector: article.company-card (带 data-company-id 属性)\n",
+    "cards = soup.select(\"article.company-card\")\n",
+    "print(\"本页企业数:\", len(cards))\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "id": "e7042317",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:34.974057Z",
+     "iopub.status.busy": "2026-10-10T07:57:34.973880Z",
+     "iopub.status.idle": "2026-10-10T07:57:34.978157Z",
+     "shell.execute_reply": "2026-10-10T07:57:34.977503Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "第一条企业: {'company_id': 'C000001', 'name': '临港精工001有限公司', 'industry': '汽车零部件', 'zone': '智造一区', 'device_count': 6, 'status': '运营中'}\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 3.2 提取一条企业的完整字段\n",
+    "import re\n",
+    "\n",
+    "def parse_company_card(card):\n",
+    "    company_id = card.get(\"data-company-id\")\n",
+    "    name = card.select_one(\"h2 a\").get_text(strip=True)\n",
+    "    status = card.select_one(\".badge\").get_text(strip=True)\n",
+    "\n",
+    "    details = {}\n",
+    "    for item in card.select(\"dl > div\"):\n",
+    "        key = item.select_one(\"dt\").get_text(strip=True)\n",
+    "        value = item.select_one(\"dd\").get_text(strip=True)\n",
+    "        details[key] = value\n",
+    "\n",
+    "    industry = details.get(\"所属行业\", \"\")\n",
+    "    zone = details.get(\"所在区域\", \"\")\n",
+    "    device_count = int(re.search(r\"\\d+\", details.get(\"设备数量\", \"0\")).group())\n",
+    "\n",
+    "    return {\n",
+    "        \"company_id\": company_id,\n",
+    "        \"name\": name,\n",
+    "        \"industry\": industry,\n",
+    "        \"zone\": zone,\n",
+    "        \"device_count\": device_count,\n",
+    "        \"status\": status,\n",
+    "    }\n",
+    "\n",
+    "card = cards[0]\n",
+    "first_company = parse_company_card(card)\n",
+    "print(\"第一条企业:\", first_company)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "id": "d8b06d1c",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:34.979862Z",
+     "iopub.status.busy": "2026-10-10T07:57:34.979662Z",
+     "iopub.status.idle": "2026-10-10T07:57:34.996426Z",
+     "shell.execute_reply": "2026-10-10T07:57:34.994692Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "本页企业数: 20\n",
+      "示例 3 条:\n",
+      "  {'company_id': 'C000001', 'name': '临港精工001有限公司', 'industry': '汽车零部件', 'zone': '智造一区', 'device_count': 6, 'status': '运营中'}\n",
+      "  {'company_id': 'C000002', 'name': '临港装备002有限公司', 'industry': '精密电子', 'zone': '智造二区', 'device_count': 26, 'status': '运营中'}\n",
+      "  {'company_id': 'C000003', 'name': '临港动力003有限公司', 'industry': '精密电子', 'zone': '智造一区', 'device_count': 6, 'status': '运营中'}\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 3.3 解析本页 20 条企业\n",
+    "companies_page1 = [parse_company_card(c) for c in cards]\n",
+    "print(\"本页企业数:\", len(companies_page1))\n",
+    "print(\"示例 3 条:\")\n",
+    "for c in companies_page1[:3]:\n",
+    "    print(\" \", c)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "578c1b13",
+   "metadata": {},
+   "source": [
+    "# 任务 4：Company \"下一页\"分页采集 3 页"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "id": "5170fe71",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:34.999722Z",
+     "iopub.status.busy": "2026-10-10T07:57:34.999357Z",
+     "iopub.status.idle": "2026-10-10T07:57:35.009580Z",
+     "shell.execute_reply": "2026-10-10T07:57:35.005963Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "所有分页链接: [('下一页', '/companies?page=2')]\n",
+      "[next-page] selector 命中: True\n",
+      "text: 下一页\n",
+      "href: /companies?page=2\n",
+      "absolute: https://115.159.159.82/companies?page=2\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 4.1 验证\"下一页\"链接\n",
+    "# 关键陷阱：nav.pagination 第一个 <a> 可能是\"上一页\"\n",
+    "# 必须按文本精确匹配 \"下一页\"\n",
+    "all_links = soup.select(\"nav.pagination a\")\n",
+    "print(\"所有分页链接:\", [(a.get_text(strip=True), a.get(\"href\")) for a in all_links])\n",
+    "\n",
+    "next_link = next((a for a in all_links if a.get_text(strip=True) == \"下一页\"), None)\n",
+    "print(\"[next-page] selector 命中:\", next_link is not None)\n",
+    "if next_link:\n",
+    "    print(\"text:\", next_link.get_text(strip=True))\n",
+    "    print(\"href:\", next_link.get(\"href\"))\n",
+    "    next_url = urljoin(current_url, next_link.get(\"href\"))\n",
+    "    print(\"absolute:\", next_url)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "id": "da1c17c3",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:35.012568Z",
+     "iopub.status.busy": "2026-10-10T07:57:35.012256Z",
+     "iopub.status.idle": "2026-10-10T07:57:35.364561Z",
+     "shell.execute_reply": "2026-10-10T07:57:35.363522Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "第 1 页: https://115.159.159.82/companies  →  20 条\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "第 2 页: https://115.159.159.82/companies?page=2  →  20 条\n",
+      "第 3 页: https://115.159.159.82/companies?page=3  →  20 条\n",
+      "[summary] Company 总数: 60\n",
+      "唯一 company_id: 60\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 4.2 三页连续采集\n",
+    "companies = []\n",
+    "current_url = f\"{BASE_URL}/companies\"\n",
+    "\n",
+    "for page_idx in range(3):\n",
+    "    if page_idx == 0:\n",
+    "        url = current_url\n",
+    "    else:\n",
+    "        # 用当前页的 soup 重新找\"下一页\"\n",
+    "        next_link = next(\n",
+    "            (a for a in soup.select(\"nav.pagination a\")\n",
+    "             if a.get_text(strip=True) == \"下一页\"),\n",
+    "            None\n",
+    "        )\n",
+    "        if next_link is None:\n",
+    "            print(f\"第 {page_idx+1} 页已无下一页，停止\")\n",
+    "            break\n",
+    "        url = urljoin(current_url, next_link.get(\"href\"))\n",
+    "\n",
+    "    r = session.get(url, timeout=10)\n",
+    "    soup = BeautifulSoup(r.text, \"html.parser\")\n",
+    "    cards = soup.select(\"article.company-card\")\n",
+    "    page_companies = [parse_company_card(c) for c in cards]\n",
+    "    companies.extend(page_companies)\n",
+    "    print(f\"第 {page_idx+1} 页: {url}  →  {len(page_companies)} 条\")\n",
+    "\n",
+    "print(f\"[summary] Company 总数: {len(companies)}\")\n",
+    "print(f\"唯一 company_id: {len(set(c['company_id'] for c in companies))}\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "1af5412a",
+   "metadata": {},
+   "source": [
+    "# 任务 5：结果验证"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "id": "ee380bd1",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:35.366635Z",
+     "iopub.status.busy": "2026-10-10T07:57:35.366431Z",
+     "iopub.status.idle": "2026-10-10T07:57:35.370811Z",
+     "shell.execute_reply": "2026-10-10T07:57:35.369936Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Company 总数: 60\n",
+      "唯一 company_id: 60\n",
+      "Device 总数: 5000\n",
+      "唯一 device_id: 5000\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 5.1 数量与 ID 唯一性\n",
+    "companies_n = len(companies)\n",
+    "companies_unique = len(set(c[\"company_id\"] for c in companies))\n",
+    "\n",
+    "devices_n = len(devices)\n",
+    "devices_unique = len(set(d[\"device_id\"] for d in devices))\n",
+    "\n",
+    "print(f\"Company 总数: {companies_n}\")\n",
+    "print(f\"唯一 company_id: {companies_unique}\")\n",
+    "print(f\"Device 总数: {devices_n}\")\n",
+    "print(f\"唯一 device_id: {devices_unique}\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "id": "f81705ce",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:35.372105Z",
+     "iopub.status.busy": "2026-10-10T07:57:35.371921Z",
+     "iopub.status.idle": "2026-10-10T07:57:35.376570Z",
+     "shell.execute_reply": "2026-10-10T07:57:35.376042Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Company–Device 不一致企业数: 0\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 5.2 Company–Device 一致性\n",
+    "device_counts = Counter(d[\"company_id\"] for d in devices)\n",
+    "\n",
+    "mismatch_count = 0\n",
+    "mismatches = []\n",
+    "for company in companies:\n",
+    "    cid = company[\"company_id\"]\n",
+    "    expected = company[\"device_count\"]\n",
+    "    actual = device_counts.get(cid, 0)\n",
+    "    if expected != actual:\n",
+    "        mismatch_count += 1\n",
+    "        if len(mismatches) < 5:\n",
+    "            mismatches.append((cid, company[\"name\"], expected, actual))\n",
+    "\n",
+    "print(f\"Company–Device 不一致企业数: {mismatch_count}\")\n",
+    "if mismatches:\n",
+    "    print(\"示例不一致:\")\n",
+    "    for m in mismatches:\n",
+    "        print(\" \", m)\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "4a3a57a2",
+   "metadata": {},
+   "source": [
+    "# 任务 6：保存采集结果"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "id": "30d708d1",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-10-10T07:57:35.378088Z",
+     "iopub.status.busy": "2026-10-10T07:57:35.377887Z",
+     "iopub.status.idle": "2026-10-10T07:57:35.451497Z",
+     "shell.execute_reply": "2026-10-10T07:57:35.450518Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "已保存:\n",
+      "  data\\devices.json\n",
+      "  data\\companies.json\n",
+      "  devices.json 条数: 5000\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "  companies.json 条数: 60\n"
+     ]
+    }
+   ],
+   "source": [
+    "# 6.1 保存 JSON\n",
+    "data_dir = Path(\"data\")\n",
+    "data_dir.mkdir(exist_ok=True)\n",
+    "\n",
+    "with open(data_dir / \"devices.json\", \"w\", encoding=\"utf-8\") as f:\n",
+    "    json.dump(devices, f, ensure_ascii=False, indent=2)\n",
+    "\n",
+    "with open(data_dir / \"companies.json\", \"w\", encoding=\"utf-8\") as f:\n",
+    "    json.dump(companies, f, ensure_ascii=False, indent=2)\n",
+    "\n",
+    "print(\"已保存:\")\n",
+    "print(\" \", data_dir / \"devices.json\")\n",
+    "print(\" \", data_dir / \"companies.json\")\n",
+    "print(\"  devices.json 条数:\", len(json.load(open(data_dir/\"devices.json\", encoding=\"utf-8\"))))\n",
+    "print(\"  companies.json 条数:\", len(json.load(open(data_dir/\"companies.json\", encoding=\"utf-8\"))))\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "ff4d7aae",
+   "metadata": {},
+   "source": [
+    "# 自检清单\n",
+    "\n",
+    "```text\n",
+    "□ 会用\"查看网页源代码\"判断静态 / 动态加载\n",
+    "□ 能在 Network 中找到 Device API\n",
+    "□ 能读懂 API 分页结构并自动计算总页数\n",
+    "□ Device 共采集 5000 条，device_id 无重复\n",
+    "□ 能设计简洁、稳定的 Company CSS Selector\n",
+    "□ 能定位\"下一页\"并读取 href\n",
+    "□ Company 连续采集 3 页，共 60 条\n",
+    "□ company_id 无重复\n",
+    "□ Company–Device 数量检查通过\n",
+    "□ 已保存 companies.json 和 devices.json\n",
+    "```\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.14"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
